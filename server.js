@@ -45,6 +45,7 @@ app.use(express.json());
 // Middleware: resolve registryId to a local filesystem path
 app.use("/api", (req, res, next) => {
   if (req.path === "/server-registries") return next();
+  if (req.path === "/_debug") return next();
   if (!req.query.registryId) {
     return res.status(400).json({ error: "Missing registryId parameter" });
   }
@@ -153,6 +154,36 @@ function listAllPortNames(rootDir) {
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
+
+app.get("/api/_debug", (req, res) => {
+  const serverRegDir = path.join(__dirname, "server-registries");
+  const info = {
+    __dirname,
+    cwd: process.cwd(),
+    rootEntries: safeReaddir(__dirname),
+    serverRegExists: fs.existsSync(serverRegDir),
+    serverRegEntries: safeReaddir(serverRegDir),
+    registries: [],
+  };
+  for (const [id, reg] of serverRegistries) {
+    info.registries.push({
+      id,
+      path: reg.path,
+      exists: fs.existsSync(reg.path),
+      hasPortsDir: fs.existsSync(path.join(reg.path, "ports")),
+      portsSample: safeReaddir(path.join(reg.path, "ports")).slice(0, 5),
+    });
+  }
+  res.json(info);
+});
+
+function safeReaddir(p) {
+  try {
+    return fs.readdirSync(p);
+  } catch (e) {
+    return { error: e.message };
+  }
+}
 
 app.get("/api/server-registries", (req, res) => {
   const list = [];
