@@ -20,34 +20,17 @@ try {
 
 const serverRegistries = new Map();
 
-function cloneOrUpdateRegistries() {
+function registerSubmoduledRegistries() {
   if (registriesConfig.length === 0) return;
-  if (!fs.existsSync(CLONE_DIR)) fs.mkdirSync(CLONE_DIR, { recursive: true });
 
   for (const reg of registriesConfig) {
     const dest = path.join(CLONE_DIR, reg.id);
-    const entry = { ...reg, path: dest, status: "pending", error: null };
+    const entry = { ...reg, status: "ready", error: null };
     serverRegistries.set(reg.id, entry);
-
-    try {
-      if (fs.existsSync(path.join(dest, ".git"))) {
-        console.log(`Updating ${reg.id} ...`);
-        execSync("git pull --ff-only", { cwd: dest, stdio: "pipe", timeout: 120_000 });
-      } else {
-        console.log(`Cloning ${reg.id} ...`);
-        execSync(`git clone --depth 1 "${reg.url}" "${dest}"`, { stdio: "pipe", timeout: 300_000 });
-      }
-      entry.status = "ready";
-      console.log(`  ${reg.id} ready`);
-    } catch (err) {
-      entry.status = "error";
-      entry.error = err.stderr ? err.stderr.toString().trim() : err.message;
-      console.error(`  ${reg.id} failed: ${entry.error}`);
-    }
   }
 }
 
-cloneOrUpdateRegistries();
+registerSubmoduledRegistries();
 
 function resolveRegistryPath(registryId) {
   const reg = serverRegistries.get(registryId);

@@ -1,0 +1,6 @@
+[submodule "server-registries/vcpkg-registry"]
+	path = server-registries/vcpkg-registry
+	url = https://github.com/carbonengine/vcpkg-registry.git
+[submodule "server-registries/vcpkg"]
+	path = server-registries/vcpkg
+	url = https://github.com/microsoft/vcpkg.git
