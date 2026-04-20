@@ -24,8 +24,8 @@ function registerSubmoduledRegistries() {
   if (registriesConfig.length === 0) return;
 
   for (const reg of registriesConfig) {
-    const dest = path.join(CLONE_DIR, reg.id);
-    const entry = { ...reg, status: "ready", error: null };
+    const absPath = path.isAbsolute(reg.path) ? reg.path : path.join(__dirname, reg.path);
+    const entry = { ...reg, path: absPath, status: "ready", error: null };
     serverRegistries.set(reg.id, entry);
   }
 }
