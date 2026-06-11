@@ -294,10 +294,6 @@ main {
   font-family: var(--mono);
   color: var(--text-dim);
 }
-.version-tag.latest {
-  border-color: var(--accent);
-  color: var(--accent);
-}
 .version-tag.selectable {
   cursor: pointer;
 }

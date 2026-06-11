@@ -814,7 +814,6 @@
         const port = v["port-version"] != null ? `#${v["port-version"]}` : "";
         const isSelected = state.activeVersion ? state.activeVersion.index === i : i === 0;
         const classes = ["version-tag"];
-        if (i === 0) classes.push("latest");
         if (selectable && v["git-tree"]) classes.push("selectable");
         if (isSelected) classes.push("selected");
         const title = selectable && v["git-tree"] ? "Browse this version" : "";
