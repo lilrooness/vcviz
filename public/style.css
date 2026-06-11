@@ -298,6 +298,28 @@ main {
   border-color: var(--accent);
   color: var(--accent);
 }
+.version-tag.selectable {
+  cursor: pointer;
+}
+.version-tag.selectable:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+.version-tag.selected {
+  background: var(--accent-bg);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.version-notice {
+  background: var(--accent-bg);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  font-size: .8rem;
+  padding: .45rem .7rem;
+  margin-bottom: 1.25rem;
+}
 
 /* Features list */
 .features-list {

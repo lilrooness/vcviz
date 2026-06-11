@@ -167,7 +167,6 @@
 
   async function open(portName) {
     currentRoot = portName;
-    rootLabel.textContent = portName;
     overlay.classList.remove("hidden");
     showStatus("Resolving dependency tree\u2026");
     hierarchyMode = true;
@@ -176,13 +175,21 @@
     const depth = parseInt(depthSlider.value) || 4;
     const appState = window.vcviz && window.vcviz.getState();
 
+    // When a historic version of the root port is selected, its direct
+    // dependencies are resolved at that version (transitive ones at head)
+    const activeVersion = appState && appState.activePort === portName ? appState.activeVersion : null;
+    rootLabel.textContent = activeVersion ? `${portName} @ ${activeVersion.version}` : portName;
+
+    if (window.vcviz && window.vcviz.setDepsOpen) window.vcviz.setDepsOpen(true);
+
     try {
       let data;
 
       if (appState && appState.localMode) {
         data = await window.vcviz.localBuildDepGraph(portName, depth);
       } else if (appState && appState.serverRegistryId) {
-        const apiUrl = `/api/depgraph/${encodeURIComponent(portName)}?depth=${depth}&registryId=${encodeURIComponent(appState.serverRegistryId)}`;
+        let apiUrl = `/api/depgraph/${encodeURIComponent(portName)}?depth=${depth}&registryId=${encodeURIComponent(appState.serverRegistryId)}`;
+        if (activeVersion) apiUrl += `&gitTree=${encodeURIComponent(activeVersion.gitTree)}`;
         const res = await fetch(apiUrl);
         data = await res.json();
         if (!res.ok) throw new Error(data.error || "Request failed");
@@ -201,6 +208,7 @@
 
   function close() {
     overlay.classList.add("hidden");
+    if (window.vcviz && window.vcviz.setDepsOpen) window.vcviz.setDepsOpen(false);
     if (simulation) simulation.stop();
     canvas.innerHTML = "";
     currentRoot = null;
@@ -446,7 +454,7 @@
   }
 
   function zoomToFit(nodes) {
-    if (!nodes.length || !svg || !gAll) return;
+    if (!nodes || !nodes.length || !svg || !gAll) return;
     const width = canvas.clientWidth;
     const height = canvas.clientHeight;
 

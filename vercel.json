@@ -1,7 +1,7 @@
 {
   "functions": {
     "server.js": {
-      "includeFiles": "server-registries/**"
+      "includeFiles": "{server-registries/**,.git/modules/**}"
     }
   }
 }

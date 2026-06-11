@@ -12,6 +12,7 @@
     detailName: $("#detail-name"),
     detailVersion: $("#detail-version"),
     detailDescription: $("#detail-description"),
+    versionNotice: $("#version-notice"),
     versionList: $("#version-list"),
     featuresSection: $("#features-section"),
     featuresList: $("#features-list"),
@@ -32,7 +33,66 @@
     localMode: false,
     localTree: null,
     serverRegistryId: null,
+    versions: [],        // version history entries of the active port
+    activeVersion: null, // { index, version, portVersion, gitTree } or null = latest (head)
+    expandedFile: null,  // path of the file currently open in the inline viewer
+    depsOpen: false,     // dependency graph overlay visible
   };
+
+  // -------------------------------------------------------------------------
+  // Shareable URLs — mirror browsing state into the query string
+  // -------------------------------------------------------------------------
+
+  let suppressUrlSync = false;
+
+  function updateUrl(push = false) {
+    if (suppressUrlSync || state.localMode) return;
+    const params = new URLSearchParams();
+    if (state.serverRegistryId) params.set("registry", state.serverRegistryId);
+    if (state.activePort) params.set("port", state.activePort);
+    if (state.activeVersion) {
+      params.set("version", state.activeVersion.version);
+      if (state.activeVersion.portVersion != null) {
+        params.set("portVersion", String(state.activeVersion.portVersion));
+      }
+    }
+    if (state.expandedFile) params.set("file", state.expandedFile);
+    if (state.depsOpen) params.set("deps", "1");
+    const qs = params.toString();
+    const url = qs ? "?" + qs : location.pathname;
+    if (push) history.pushState(null, "", url);
+    else history.replaceState(null, "", url);
+  }
+
+  async function applyUrlState() {
+    const params = new URLSearchParams(location.search);
+    const registry = params.get("registry");
+    if (!registry) return false;
+
+    suppressUrlSync = true;
+    try {
+      if (state.localMode) exitLocalMode();
+      els.serverRegistrySelect.value = registry;
+      await loadServerRegistry(registry);
+      if (!state.serverRegistryId) return false;
+
+      const port = params.get("port");
+      if (port && state.ports.includes(port)) {
+        await selectPort(port, {
+          version: params.get("version"),
+          portVersion: params.get("portVersion"),
+          file: params.get("file"),
+          deps: params.get("deps") === "1",
+        });
+        const activeLi = els.portList.querySelector("li.active");
+        if (activeLi) activeLi.scrollIntoView({ block: "center" });
+      }
+    } finally {
+      suppressUrlSync = false;
+      updateUrl(false);
+    }
+    return true;
+  }
 
   // -------------------------------------------------------------------------
   // Utilities
@@ -384,7 +444,12 @@
   function enterLocalMode(folderName) {
     state.localMode = true;
     state.serverRegistryId = null;
+    state.versions = [];
+    state.activeVersion = null;
+    state.expandedFile = null;
+    state.depsOpen = false;
     featureUsageCache = {};
+    history.replaceState(null, "", location.pathname);
     els.serverRegistrySelect.value = "";
     els.sourceServer.classList.add("hidden");
     els.dropZone.classList.add("hidden");
@@ -399,6 +464,10 @@
     state.baseline = {};
     state.activePort = null;
     state.serverRegistryId = null;
+    state.versions = [];
+    state.activeVersion = null;
+    state.expandedFile = null;
+    state.depsOpen = false;
     featureUsageCache = {};
     els.serverRegistrySelect.value = "";
     els.sourceServer.classList.remove("hidden");
@@ -455,6 +524,10 @@
     state.activePort = null;
     state.localMode = false;
     state.localTree = null;
+    state.versions = [];
+    state.activeVersion = null;
+    state.expandedFile = null;
+    state.depsOpen = false;
 
     try {
       const [portData, baselineData] = await Promise.all([
@@ -518,8 +591,174 @@
   // Port detail
   // -------------------------------------------------------------------------
 
-  async function selectPort(name) {
+  function versionEntryLabel(v) {
+    return v.version || v["version-string"] || v["version-semver"] || v["version-date"] || "?";
+  }
+
+  // Version-aware data access. When a historic version is selected, files come
+  // from the git-tree of that version; paths are then relative to the port
+  // directory instead of "ports/<name>/...".
+  async function fetchPortFiles() {
+    if (state.activeVersion) {
+      const data = await api(
+        `/api/version-files/${encodeURIComponent(state.activePort)}?gitTree=${state.activeVersion.gitTree}`
+      );
+      return data.files || [];
+    }
+    if (state.localMode) return localGetPortFiles(state.activePort);
+    return (await api(`/api/ports/${encodeURIComponent(state.activePort)}`)).files || [];
+  }
+
+  async function fetchDirFiles(dirPath) {
+    if (state.activeVersion) {
+      const data = await api(
+        `/api/version-files/${encodeURIComponent(state.activePort)}?gitTree=${state.activeVersion.gitTree}&path=${encodeURIComponent(dirPath)}`
+      );
+      return data.files || [];
+    }
+    if (state.localMode) return localListDir(dirPath);
+    return (await api(`/api/dir?path=${encodeURIComponent(dirPath)}`)).files || [];
+  }
+
+  async function fetchFileContent(filePath) {
+    if (state.activeVersion) {
+      return (await api(
+        `/api/version-file?gitTree=${state.activeVersion.gitTree}&path=${encodeURIComponent(filePath)}`
+      )).content;
+    }
+    if (state.localMode) return (await localReadFile(filePath)).content;
+    return (await api(`/api/file?path=${encodeURIComponent(filePath)}`)).content;
+  }
+
+  function renderVersionList() {
+    const versions = state.versions;
+    if (versions.length === 0) {
+      els.versionList.innerHTML = '<span class="version-tag">No version history found</span>';
+      return;
+    }
+    const selectable = !state.localMode;
+    els.versionList.innerHTML = versions
+      .map((v, i) => {
+        const ver = versionEntryLabel(v);
+        const port = v["port-version"] != null ? `#${v["port-version"]}` : "";
+        const isSelected = state.activeVersion ? state.activeVersion.index === i : i === 0;
+        const classes = ["version-tag"];
+        if (i === 0) classes.push("latest");
+        if (selectable && v["git-tree"]) classes.push("selectable");
+        if (isSelected) classes.push("selected");
+        const title = selectable && v["git-tree"] ? "Browse this version" : "";
+        return `<span class="${classes.join(" ")}" data-vindex="${i}"${title ? ` title="${title}"` : ""}>${escapeHtml(ver)}${port}</span>`;
+      })
+      .join("");
+  }
+
+  function renderVersionNotice() {
+    if (state.activeVersion) {
+      const av = state.activeVersion;
+      const pv = av.portVersion != null ? `#${av.portVersion}` : "";
+      els.versionNotice.textContent =
+        `Browsing version ${av.version}${pv} (git-tree ${av.gitTree.slice(0, 10)}). ` +
+        `Files and dependencies below reflect this version.`;
+      els.versionNotice.classList.remove("hidden");
+    } else {
+      els.versionNotice.textContent = "";
+      els.versionNotice.classList.add("hidden");
+    }
+  }
+
+  // Fetch and render description, features and files for the active port at
+  // the active version (head when state.activeVersion is null).
+  async function loadPortContents() {
+    const name = state.activePort;
+
+    closeInlineViewer();
+    els.detailDescription.textContent = "Loading\u2026";
+    els.featuresSection.classList.add("hidden");
+    els.featuresList.innerHTML = "";
+    els.fileList.innerHTML = "";
+    renderVersionNotice();
+
+    const portFiles = await fetchPortFiles();
+    if (name !== state.activePort) return; // user navigated away meanwhile
+
+    let description = "";
+    let currentVersion = "";
+    let features = null;
+
+    const vcpkgJsonFile = portFiles.find((f) => f.name === "vcpkg.json");
+    const controlFile = portFiles.find((f) => f.name === "CONTROL");
+    if (vcpkgJsonFile) {
+      try {
+        const manifest = JSON.parse(await fetchFileContent(vcpkgJsonFile.path));
+        description = manifest.description || "";
+        if (Array.isArray(description)) description = description.join(" ");
+        currentVersion =
+          manifest.version || manifest["version-string"] || manifest["version-semver"] || manifest["version-date"] || "";
+        if (manifest.features && typeof manifest.features === "object") {
+          features = manifest.features;
+        }
+      } catch {}
+    } else if (controlFile) {
+      // Old port versions predate vcpkg.json manifests
+      try {
+        const content = await fetchFileContent(controlFile.path);
+        const dm = /^Description:\s*(.+)$/m.exec(content);
+        const vm = /^Version:\s*(.+)$/m.exec(content);
+        if (dm) description = dm[1].trim();
+        if (vm) currentVersion = vm[1].trim();
+      } catch {}
+    }
+    if (name !== state.activePort) return;
+
+    if (state.activeVersion) {
+      const pv = state.activeVersion.portVersion != null ? `#${state.activeVersion.portVersion}` : "";
+      currentVersion = state.activeVersion.version + pv;
+    } else if (!currentVersion) {
+      const blVer = state.baseline[name];
+      if (blVer) {
+        currentVersion = blVer["baseline"] || blVer["version-string"] || blVer["version"] || "";
+      }
+    }
+
+    els.detailVersion.textContent = currentVersion ? "v" + currentVersion : "";
+    els.detailDescription.textContent = description || "No description available.";
+
+    // Features
+    if (features && Object.keys(features).length > 0) {
+      els.featuresSection.classList.remove("hidden");
+      els.featuresList.innerHTML = Object.entries(features)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([fname, fdata]) => {
+          let desc = fdata.description || "";
+          if (Array.isArray(desc)) desc = desc.join(" ");
+          const deps = fdata.dependencies || [];
+          const depNames = deps.map((d) => typeof d === "string" ? d : (d && d.name) || "").filter(Boolean);
+          const usagesHtml = `<div class="feature-usages">
+                <button class="feature-usages-toggle" data-feature="${escapeHtml(fname)}" data-port="${escapeHtml(name)}">
+                  <span class="usages-arrow">&#9654;</span> Used by&hellip;
+                </button>
+                <div class="feature-usages-list hidden"></div>
+              </div>`;
+          return `<div class="feature-item">
+            <div class="feature-header">
+              <span class="feature-name">${escapeHtml(fname)}</span>
+              ${depNames.length ? `<span class="feature-deps">${depNames.map((d) => escapeHtml(d)).join(", ")}</span>` : ""}
+            </div>
+            ${desc ? `<div class="feature-desc">${escapeHtml(desc)}</div>` : ""}
+            ${usagesHtml}
+          </div>`;
+        })
+        .join("");
+    }
+
+    renderFileEntries(els.fileList, portFiles, 0);
+  }
+
+  async function selectPort(name, opts = {}) {
     state.activePort = name;
+    state.activeVersion = null;
+    state.expandedFile = null;
+    state.versions = [];
     renderPortList(els.portSearch.value);
 
     els.detailPlaceholder.classList.add("hidden");
@@ -533,99 +772,90 @@
     els.featuresSection.classList.add("hidden");
     els.featuresList.innerHTML = "";
     els.fileList.innerHTML = "";
+    renderVersionNotice();
+    updateUrl(true);
 
     try {
-      let portFiles, versionData;
-
+      let versionData;
       if (state.localMode) {
-        portFiles = localGetPortFiles(name);
         versionData = await localGetVersions(name);
       } else {
-        const [pd, vd] = await Promise.all([
-          api(`/api/ports/${encodeURIComponent(name)}`),
-          api(`/api/versions/${encodeURIComponent(name)}`).catch(() => ({ versions: [] })),
-        ]);
-        portFiles = pd.files;
-        versionData = vd;
+        versionData = await api(`/api/versions/${encodeURIComponent(name)}`).catch(() => ({ versions: [] }));
+      }
+      if (name !== state.activePort) return;
+      state.versions = versionData.versions || [];
+
+      // Restore a version requested via URL (index 0 is the head/latest)
+      if (opts.version) {
+        const idx = state.versions.findIndex(
+          (v) =>
+            versionEntryLabel(v) === opts.version &&
+            (opts.portVersion == null || String(v["port-version"] ?? "") === String(opts.portVersion))
+        );
+        if (idx > 0 && state.versions[idx]["git-tree"]) {
+          state.activeVersion = {
+            index: idx,
+            version: versionEntryLabel(state.versions[idx]),
+            portVersion: state.versions[idx]["port-version"] ?? null,
+            gitTree: state.versions[idx]["git-tree"],
+          };
+        }
       }
 
-      let description = "";
-      let currentVersion = "";
-      const vcpkgJsonFile = portFiles.find((f) => f.name === "vcpkg.json");
+      renderVersionList();
+      await loadPortContents();
 
-      let features = null;
-      if (vcpkgJsonFile) {
-        try {
-          let fileContent;
-          if (state.localMode) {
-            fileContent = (await localReadFile(vcpkgJsonFile.path)).content;
-          } else {
-            fileContent = (await api(`/api/file?path=${encodeURIComponent(vcpkgJsonFile.path)}`)).content;
-          }
-          const manifest = JSON.parse(fileContent);
-          description = manifest.description || "";
-          if (Array.isArray(description)) description = description.join(" ");
-          currentVersion =
-            manifest.version || manifest["version-string"] || manifest["version-semver"] || manifest["version-date"] || "";
-          if (manifest.features && typeof manifest.features === "object") {
-            features = manifest.features;
-          }
-        } catch {}
-      }
-
-      const blVer = state.baseline[name];
-      if (!currentVersion && blVer) {
-        currentVersion = blVer["baseline"] || blVer["version-string"] || blVer["version"] || "";
-      }
-
-      els.detailVersion.textContent = currentVersion ? "v" + currentVersion : "";
-      els.detailDescription.textContent = description || "No description available.";
-
-      const versions = versionData.versions || [];
-      if (versions.length > 0) {
-        els.versionList.innerHTML = versions
-          .map((v, i) => {
-            const ver = v.version || v["version-string"] || v["version-semver"] || v["version-date"] || "?";
-            const port = v["port-version"] != null ? `#${v["port-version"]}` : "";
-            return `<span class="version-tag${i === 0 ? " latest" : ""}">${escapeHtml(ver)}${port}</span>`;
-          })
-          .join("");
-      } else {
-        els.versionList.innerHTML = '<span class="version-tag">No version history found</span>';
-      }
-
-      // Features
-      if (features && Object.keys(features).length > 0) {
-        els.featuresSection.classList.remove("hidden");
-        els.featuresList.innerHTML = Object.entries(features)
-          .sort(([a], [b]) => a.localeCompare(b))
-          .map(([fname, fdata]) => {
-            let desc = fdata.description || "";
-            if (Array.isArray(desc)) desc = desc.join(" ");
-            const deps = fdata.dependencies || [];
-            const depNames = deps.map((d) => typeof d === "string" ? d : (d && d.name) || "").filter(Boolean);
-            const usagesHtml = `<div class="feature-usages">
-                  <button class="feature-usages-toggle" data-feature="${escapeHtml(fname)}" data-port="${escapeHtml(name)}">
-                    <span class="usages-arrow">&#9654;</span> Used by&hellip;
-                  </button>
-                  <div class="feature-usages-list hidden"></div>
-                </div>`;
-            return `<div class="feature-item">
-              <div class="feature-header">
-                <span class="feature-name">${escapeHtml(fname)}</span>
-                ${depNames.length ? `<span class="feature-deps">${depNames.map((d) => escapeHtml(d)).join(", ")}</span>` : ""}
-              </div>
-              ${desc ? `<div class="feature-desc">${escapeHtml(desc)}</div>` : ""}
-              ${usagesHtml}
-            </div>`;
-          })
-          .join("");
-      }
-
-      renderFileEntries(els.fileList, portFiles, 0);
+      if (opts.file) await revealFile(opts.file);
+      if (opts.deps && window.depgraph) window.depgraph.open(name);
     } catch (err) {
       els.detailDescription.textContent = "Error loading port: " + err.message;
     }
+    updateUrl(false);
+  }
+
+  async function selectVersion(idx) {
+    const v = state.versions[idx];
+    if (!v) return;
+    if (idx !== 0 && !v["git-tree"]) return;
+
+    const prev = state.activeVersion;
+    state.activeVersion = idx === 0 ? null : {
+      index: idx,
+      version: versionEntryLabel(v),
+      portVersion: v["port-version"] ?? null,
+      gitTree: v["git-tree"],
+    };
+    state.expandedFile = null;
+    renderVersionList();
+    showError("");
+
+    try {
+      await loadPortContents();
+    } catch (err) {
+      // Likely git data unavailable on this deployment \u2014 revert to what worked
+      state.activeVersion = prev;
+      renderVersionList();
+      showError("Could not load that version: " + err.message);
+      try { await loadPortContents(); } catch {}
+    }
+    updateUrl(false);
+  }
+
+  // Expand ancestor directories and open a file (used when restoring a URL)
+  async function revealFile(filePath) {
+    const segments = filePath.split("/");
+    const prefix = [];
+    for (let i = 0; i < segments.length - 1; i++) {
+      prefix.push(segments[i]);
+      const li = els.fileList.querySelector(
+        `li[data-path="${CSS.escape(prefix.join("/"))}"][data-type="dir"]`
+      );
+      if (li && !li.classList.contains("expanded")) await toggleDirectory(li);
+    }
+    const fileLi = els.fileList.querySelector(
+      `li[data-path="${CSS.escape(filePath)}"][data-type="file"]`
+    );
+    if (fileLi) await viewFile(filePath, fileLi);
   }
 
   // -------------------------------------------------------------------------
@@ -651,13 +881,7 @@
     const depth = Math.round((parseFloat(li.style.paddingLeft) - 1) / 1.2) + 1;
 
     try {
-      let files;
-      if (state.localMode) {
-        files = localListDir(dirPath);
-      } else {
-        const data = await api(`/api/dir?path=${encodeURIComponent(dirPath)}`);
-        files = data.files || [];
-      }
+      const files = await fetchDirFiles(dirPath);
 
       const temp = document.createElement("ul");
       renderFileEntries(temp, files, depth);
@@ -677,6 +901,7 @@
   }
 
   function closeInlineViewer() {
+    state.expandedFile = null;
     const existing = els.fileList.querySelector(".inline-file-viewer");
     if (existing) {
       const parentLi = existing.previousElementSibling;
@@ -688,9 +913,14 @@
   async function viewFile(filePath, clickedLi) {
     const alreadyOpen = clickedLi.classList.contains("viewing");
     closeInlineViewer();
-    if (alreadyOpen) return;
+    if (alreadyOpen) {
+      updateUrl(false);
+      return;
+    }
 
     clickedLi.classList.add("viewing");
+    state.expandedFile = filePath;
+    updateUrl(false);
 
     const viewerLi = document.createElement("li");
     viewerLi.className = "inline-file-viewer";
@@ -711,15 +941,14 @@
       e.stopPropagation();
       clickedLi.classList.remove("viewing");
       viewerLi.remove();
+      if (state.expandedFile === filePath) {
+        state.expandedFile = null;
+        updateUrl(false);
+      }
     });
 
     try {
-      let content;
-      if (state.localMode) {
-        content = (await localReadFile(filePath)).content;
-      } else {
-        content = (await api(`/api/file?path=${encodeURIComponent(filePath)}`)).content;
-      }
+      const content = await fetchFileContent(filePath);
       const codeEl = viewerLi.querySelector("code");
       const fileName = filePath.split("/").pop();
       if (/\.(patch|diff)$/i.test(fileName)) {
@@ -801,6 +1030,14 @@
     if (li) selectPort(li.dataset.port);
   });
 
+  els.versionList.addEventListener("click", (e) => {
+    const tag = e.target.closest(".version-tag.selectable");
+    if (!tag) return;
+    const idx = parseInt(tag.dataset.vindex, 10);
+    const isSelected = state.activeVersion ? state.activeVersion.index === idx : idx === 0;
+    if (!isSelected) selectVersion(idx);
+  });
+
   els.fileList.addEventListener("click", (e) => {
     if (e.target.closest(".inline-file-viewer")) return;
     const li = e.target.closest("li[data-path]");
@@ -860,7 +1097,7 @@
     if (portSpan) selectPort(portSpan.dataset.port);
   });
 
-  els.serverRegistrySelect.addEventListener("change", () => {
+  els.serverRegistrySelect.addEventListener("change", async () => {
     const id = els.serverRegistrySelect.value;
     if (!id) return;
     state.localMode = false;
@@ -868,12 +1105,14 @@
     featureUsageCache = {};
     els.localBanner.classList.add("hidden");
     els.dropZone.classList.remove("hidden");
-    loadServerRegistry(id);
+    await loadServerRegistry(id);
+    updateUrl(true);
   });
 
   els.localClose.addEventListener("click", exitLocalMode);
 
-  // On page load, populate the server registries dropdown
+  // On page load, populate the server registries dropdown, then restore any
+  // state shared via the URL
   (async function populateServerRegistries() {
     try {
       const data = await fetch("/api/server-registries").then((r) => r.json());
@@ -893,14 +1132,40 @@
     } catch {
       els.sourceServer.classList.add("hidden");
     }
+    applyUrlState();
   })();
 
+  window.addEventListener("popstate", () => {
+    const params = new URLSearchParams(location.search);
+    if (params.get("registry")) {
+      applyUrlState();
+    } else if (!state.localMode) {
+      // Back to the initial (no selection) state
+      state.serverRegistryId = null;
+      state.activePort = null;
+      state.activeVersion = null;
+      state.expandedFile = null;
+      els.serverRegistrySelect.value = "";
+      els.content.classList.add("hidden");
+      showError("");
+    }
+  });
+
   setupDropZone();
+
+  // Called by depgraph.js when the dependency overlay opens/closes, so the
+  // URL reflects it
+  function setDepsOpen(open) {
+    if (state.depsOpen === open) return;
+    state.depsOpen = open;
+    updateUrl(false);
+  }
 
   // Expose state for depgraph.js
   window.vcviz = {
     getState: () => state,
     selectPort,
+    setDepsOpen,
     localReadFile,
     localGetPortDependencies,
     localBuildDepGraph,

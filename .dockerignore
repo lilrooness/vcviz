@@ -1,5 +1,6 @@
 node_modules
 .git
+!.git/modules
 cloned-registries
 test-registry
 test_output.txt
