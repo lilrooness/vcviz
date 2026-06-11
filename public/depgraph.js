@@ -186,7 +186,7 @@
       let data;
 
       if (appState && appState.localMode) {
-        data = await window.vcviz.localBuildDepGraph(portName, depth);
+        data = await window.vcviz.localBuildDepGraph(portName, depth, activeVersion ? activeVersion.gitTree : null);
       } else if (appState && appState.serverRegistryId) {
         let apiUrl = `/api/depgraph/${encodeURIComponent(portName)}?depth=${depth}&registryId=${encodeURIComponent(appState.serverRegistryId)}`;
         if (activeVersion) apiUrl += `&gitTree=${encodeURIComponent(activeVersion.gitTree)}`;

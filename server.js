@@ -36,6 +36,38 @@ registerSubmoduledRegistries();
 app.use(express.static(path.join(__dirname, "public")));
 app.use(express.json());
 
+// Browser build of isomorphic-git, used by the frontend to read git data
+// from registries dropped in via drag-and-drop
+app.get("/vendor/isomorphic-git.js", (req, res) => {
+  res.sendFile(path.join(__dirname, "node_modules", "isomorphic-git", "index.umd.min.js"));
+});
+
+// isomorphic-git's UMD build calls the global Buffer (a Node-ism) when
+// reading binary files, so serve the standard feross/buffer polyfill and its
+// two deps wrapped into one IIFE that defines window.Buffer. Must be loaded
+// before isomorphic-git.js.
+let bufferBundle = null;
+app.get("/vendor/buffer-global.js", (req, res) => {
+  if (!bufferBundle) {
+    const mod = (name) => fs.readFileSync(require.resolve(name), "utf-8");
+    const wrap = (name, src) =>
+      `load(${JSON.stringify(name)}, function (module, exports, require) {\n${src}\n});`;
+    bufferBundle = `(function () {
+var modules = {};
+function load(name, fn) {
+  var module = { exports: {} };
+  fn(module, module.exports, function (dep) { return modules[dep]; });
+  modules[name] = module.exports;
+}
+${wrap("base64-js", mod("base64-js"))}
+${wrap("ieee754", mod("ieee754"))}
+${wrap("buffer", mod("buffer/"))}
+window.Buffer = modules["buffer"].Buffer;
+})();`;
+  }
+  res.type("application/javascript").send(bufferBundle);
+});
+
 // Middleware: resolve registryId to a local filesystem path
 app.use("/api", (req, res, next) => {
   if (req.path === "/server-registries") return next();

@@ -289,6 +289,169 @@
     });
   }
 
+  function readFileEntryBinary(fileEntry) {
+    return new Promise((resolve, reject) => {
+      fileEntry.file((file) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(new Uint8Array(reader.result));
+        reader.onerror = () => reject(new Error("Failed to read file"));
+        reader.readAsArrayBuffer(file);
+      }, reject);
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Versioned access for local registries: when the dropped folder is a git
+  // clone, isomorphic-git (loaded from /vendor/isomorphic-git.js) reads the
+  // git-tree objects of historic versions straight out of its .git directory,
+  // through an fs shim backed by the scanned FileSystem entries.
+  // -------------------------------------------------------------------------
+
+  let localGitCache = {}; // isomorphic-git packfile/object cache, per dropped tree
+
+  function localGitAvailable() {
+    if (!state.localTree) return false;
+    const dotGit = state.localTree.entries.get(".git");
+    return !!(dotGit && dotGit.isDirectory && window.git);
+  }
+
+  function localFsKey(p) {
+    let s = String(p).replace(/\\/g, "/");
+    while (s.startsWith("./")) s = s.slice(2);
+    if (s.startsWith("/")) s = s.slice(1);
+    return s;
+  }
+
+  function makeFsError(code, p) {
+    const e = new Error(`${code}: ${p}`);
+    e.code = code;
+    return e;
+  }
+
+  async function localFsReadFile(p, opts) {
+    const e = state.localTree.entries.get(localFsKey(p));
+    if (!e || e.isDirectory) throw makeFsError("ENOENT", p);
+    const bytes = await readFileEntryBinary(e.entry);
+    const encoding = typeof opts === "string" ? opts : opts && opts.encoding;
+    return encoding ? new TextDecoder().decode(bytes) : bytes;
+  }
+
+  async function localFsReaddir(p) {
+    const key = localFsKey(p);
+    const dir = state.localTree.entries.get(key);
+    if (!dir) throw makeFsError("ENOENT", p);
+    if (!dir.isDirectory) throw makeFsError("ENOTDIR", p);
+    const prefix = key + "/";
+    const names = [];
+    for (const [path2, e] of state.localTree.entries) {
+      if (path2.startsWith(prefix) && !path2.slice(prefix.length).includes("/")) {
+        names.push(e.name);
+      }
+    }
+    return names;
+  }
+
+  async function localFsStat(p) {
+    const e = state.localTree.entries.get(localFsKey(p));
+    if (!e) throw makeFsError("ENOENT", p);
+    const size = e.isDirectory ? 0 : (await getFileSize(e.entry)) || 0;
+    return {
+      isFile: () => !e.isDirectory,
+      isDirectory: () => e.isDirectory,
+      isSymbolicLink: () => false,
+      size,
+      mode: e.isDirectory ? 0o40000 : 0o100644,
+      mtimeMs: 0, ctimeMs: 0, uid: 1, gid: 1, dev: 1, ino: 1,
+    };
+  }
+
+  // isomorphic-git binds every fs.promises method up front, so the read-only
+  // shim still has to provide write/link stubs (never called for readTree /
+  // readBlob)
+  async function localFsUnsupported() {
+    throw makeFsError("EROFS", "read-only filesystem");
+  }
+
+  const localGitFs = {
+    promises: {
+      readFile: localFsReadFile,
+      readdir: localFsReaddir,
+      stat: localFsStat,
+      lstat: localFsStat,
+      readlink: localFsUnsupported,
+      writeFile: localFsUnsupported,
+      mkdir: localFsUnsupported,
+      rmdir: localFsUnsupported,
+      unlink: localFsUnsupported,
+      rename: localFsUnsupported,
+      symlink: localFsUnsupported,
+      chmod: localFsUnsupported,
+    },
+  };
+
+  async function localListTreeAtVersion(treeSha, subPath) {
+    if (!localGitAvailable()) {
+      throw new Error("The dropped folder has no .git directory, so version data is unavailable");
+    }
+    const res = await window.git.readTree({
+      fs: localGitFs,
+      gitdir: ".git",
+      oid: treeSha,
+      filepath: subPath || undefined,
+      cache: localGitCache,
+    });
+    return res.tree.map((e) => ({
+      name: e.path,
+      path: subPath ? `${subPath}/${e.path}` : e.path,
+      type: e.type === "tree" ? "dir" : "file",
+      size: null,
+    }));
+  }
+
+  async function localReadFileAtVersion(treeSha, filePath) {
+    if (!localGitAvailable()) {
+      throw new Error("The dropped folder has no .git directory, so version data is unavailable");
+    }
+    const res = await window.git.readBlob({
+      fs: localGitFs,
+      gitdir: ".git",
+      oid: treeSha,
+      filepath: filePath,
+      cache: localGitCache,
+    });
+    return new TextDecoder().decode(res.blob);
+  }
+
+  function parseControlDeps(text) {
+    const deps = new Set();
+    for (const line of text.split(/\r?\n/)) {
+      const m = /^(?:Build-Depends|Depends):\s*(.+)$/.exec(line);
+      if (!m) continue;
+      for (const part of m[1].split(",")) {
+        const name = part.trim().split(/[\s[(]/)[0];
+        if (name) deps.add(name);
+      }
+    }
+    return [...deps];
+  }
+
+  async function localGetPortDependenciesAtVersion(gitTree) {
+    try {
+      const manifest = JSON.parse(await localReadFileAtVersion(gitTree, "vcpkg.json"));
+      const deps = [];
+      for (const d of manifest.dependencies || []) {
+        if (typeof d === "string") deps.push(d);
+        else if (d && d.name) deps.push(d.name);
+      }
+      return [...new Set(deps)];
+    } catch {}
+    try {
+      return parseControlDeps(await localReadFileAtVersion(gitTree, "CONTROL"));
+    } catch {
+      return [];
+    }
+  }
+
   // Local data access functions -- mirror the server API shape
 
   function localListPorts() {
@@ -368,7 +531,7 @@
     }
   }
 
-  async function localBuildDepGraph(portName, maxDepth) {
+  async function localBuildDepGraph(portName, maxDepth, rootGitTree) {
     const registryPorts = new Set(state.localTree.portNames);
     const nodes = new Map();
     const edges = [];
@@ -381,11 +544,14 @@
       visited.add(port);
 
       const inRegistry = registryPorts.has(port);
-      nodes.set(port, { id: port, inRegistry, depth, isRoot: port === portName });
+      const isRoot = port === portName && depth === 0;
+      nodes.set(port, { id: port, inRegistry, depth, isRoot });
 
-      if (depth >= maxDepth || !inRegistry) continue;
+      if (depth >= maxDepth || (!inRegistry && !(isRoot && rootGitTree))) continue;
 
-      const deps = await localGetPortDependencies(port);
+      const deps = isRoot && rootGitTree
+        ? await localGetPortDependenciesAtVersion(rootGitTree)
+        : await localGetPortDependencies(port);
       for (const dep of deps) {
         edges.push({ source: port, target: dep });
         if (!visited.has(dep)) {
@@ -469,6 +635,7 @@
     state.expandedFile = null;
     state.depsOpen = false;
     featureUsageCache = {};
+    localGitCache = {};
     els.serverRegistrySelect.value = "";
     els.sourceServer.classList.remove("hidden");
     els.dropZone.classList.remove("hidden");
@@ -558,6 +725,7 @@
 
     try {
       state.localTree = await scanDirectoryTree(rootEntry);
+      localGitCache = {};
 
       if (state.localTree.portNames.length === 0) {
         showError("No ports/ directory found in the dropped folder.");
@@ -600,6 +768,7 @@
   // directory instead of "ports/<name>/...".
   async function fetchPortFiles() {
     if (state.activeVersion) {
+      if (state.localMode) return localListTreeAtVersion(state.activeVersion.gitTree, "");
       const data = await api(
         `/api/version-files/${encodeURIComponent(state.activePort)}?gitTree=${state.activeVersion.gitTree}`
       );
@@ -611,6 +780,7 @@
 
   async function fetchDirFiles(dirPath) {
     if (state.activeVersion) {
+      if (state.localMode) return localListTreeAtVersion(state.activeVersion.gitTree, dirPath);
       const data = await api(
         `/api/version-files/${encodeURIComponent(state.activePort)}?gitTree=${state.activeVersion.gitTree}&path=${encodeURIComponent(dirPath)}`
       );
@@ -622,6 +792,7 @@
 
   async function fetchFileContent(filePath) {
     if (state.activeVersion) {
+      if (state.localMode) return localReadFileAtVersion(state.activeVersion.gitTree, filePath);
       return (await api(
         `/api/version-file?gitTree=${state.activeVersion.gitTree}&path=${encodeURIComponent(filePath)}`
       )).content;
@@ -636,7 +807,7 @@
       els.versionList.innerHTML = '<span class="version-tag">No version history found</span>';
       return;
     }
-    const selectable = !state.localMode;
+    const selectable = !state.localMode || localGitAvailable();
     els.versionList.innerHTML = versions
       .map((v, i) => {
         const ver = versionEntryLabel(v);

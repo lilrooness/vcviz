@@ -8,7 +8,10 @@
     "dev": "node --watch server.js"
   },
   "dependencies": {
+    "base64-js": "^1.5.1",
+    "buffer": "^6.0.3",
     "express": "^4.21.0",
+    "ieee754": "^1.2.1",
     "isomorphic-git": "^1.38.4"
   }
 }
